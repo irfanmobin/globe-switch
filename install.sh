@@ -30,7 +30,10 @@ echo "Setting 'Press 🌐 key to' -> Do Nothing (so macOS doesn't also switch)..
 defaults write com.apple.HIToolbox AppleFnUsageType -int 0
 # TextInputSwitcher handles the Globe key (and its language popup) and caches this
 # setting. Restart it so it stops switching on its own; macOS relaunches it on demand.
+echo "Turning off macOS's language popup at the cursor (GlobeSwitch shows its own)..."
+defaults write kCFPreferencesAnyApplication TSMLanguageIndicatorEnabled -bool false
 killall -9 TextInputSwitcher 2>/dev/null || true
+killall -9 CursorUIViewService 2>/dev/null || true   # draws macOS's popup; relaunches on demand
 
 echo "Installing LaunchAgent..."
 mkdir -p "$(dirname "$PLIST")"
@@ -48,11 +51,19 @@ cat > "$PLIST" <<PL
 PL
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# bootout is asynchronous; bootstrap can fail with "5: Input/output error" until it finishes.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+    sleep 0.5
+done
+launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || { echo "Failed to load LaunchAgent $LABEL" >&2; exit 1; }
 
 echo
 echo "Done. If the Globe key doesn't switch input sources yet:"
-echo "  1. System Settings > Privacy & Security > Input Monitoring: enable GlobeSwitch ($APP)"
+echo "  1. System Settings > Privacy & Security: add GlobeSwitch ($APP) to"
+echo "       - Input Monitoring (required: lets it see the Globe key)"
+echo "       - Accessibility (recommended: shows the language bubble at your text cursor)"
+echo "     Re-installing invalidates both: remove GlobeSwitch with '-' and add it again with '+'."
 echo "  2. System Settings > Keyboard: confirm 'Press 🌐 key to' is 'Do Nothing'"
 echo "     (if quick taps still don't stick, run: killall -9 TextInputSwitcher)"
 echo "  3. Restart it: launchctl kickstart -k gui/\$(id -u)/$LABEL"
