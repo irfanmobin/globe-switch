@@ -6,6 +6,11 @@ import Carbon
 
 let kFnKeyCode: Int64 = 63
 
+func log(_ msg: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    FileHandle.standardError.write("[\(ts)] \(msg)\n".data(using: .utf8)!)
+}
+
 func selectableSources() -> [TISInputSource] {
     let filter = [kTISPropertyInputSourceIsSelectCapable as String: true,
                   kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String] as CFDictionary
@@ -32,7 +37,9 @@ func switchToNext() {
     let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
     let idx = sources.firstIndex { sourceID($0) == sourceID(current) } ?? -1
     previous = current
-    TISSelectInputSource(sources[(idx + 1) % sources.count])
+    let next = sources[(idx + 1) % sources.count]
+    let err = TISSelectInputSource(next)
+    log("switch \(sourceID(current)) -> \(sourceID(next)) (status \(err))")
 }
 
 let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
@@ -41,11 +48,13 @@ var tapRef: CFMachPort?
 
 let callback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        log("tap disabled (\(type.rawValue)), re-enabling")
         if let t = tapRef { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
     }
     if type == .flagsChanged && event.getIntegerValueField(.keyboardEventKeycode) == kFnKeyCode {
         let down = event.flags.contains(.maskSecondaryFn)
+        log("globe \(down ? "down" : "up")")
         if down && !fnDown {
             switchToNext()
             switchedThisPress = true
@@ -54,10 +63,19 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
         fnDown = down
     } else if type == .keyDown && fnDown && switchedThisPress {
         // Globe used as a modifier (fn+Delete, fn+arrows, Globe+E...): undo the switch.
-        if let prev = previous { TISSelectInputSource(prev) }
+        if let prev = previous { TISSelectInputSource(prev); log("combo key: reverted to \(sourceID(prev))") }
         switchedThisPress = false
     }
     return Unmanaged.passUnretained(event)
+}
+
+// A listen-only tap can be created without permission but then receives nothing,
+// so check explicitly, ask macOS to prompt, and let launchd retry.
+if !CGPreflightListenEventAccess() {
+    _ = CGRequestListenEventAccess()
+    log("no Input Monitoring permission. Enable GlobeSwitch in System Settings > Privacy & Security > Input Monitoring. Retrying in 15s.")
+    sleep(15)
+    exit(1)
 }
 
 tapRef = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
@@ -70,5 +88,5 @@ guard let tap = tapRef else {
 }
 CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
-print("globe-switch running")
+log("globe-switch running; input monitoring access: \(CGPreflightListenEventAccess())")
 CFRunLoopRun()
