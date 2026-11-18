@@ -33,7 +33,7 @@ cd globe-switch
 
 The installer:
 1. Compiles `main.swift` into a small background app, `~/Applications/GlobeSwitch.app` (no Dock icon), and ad-hoc signs it.
-2. Sets **System Settings → Keyboard → "Press 🌐 key to"** to **Do Nothing**, so macOS doesn't switch a second time and cancel globe-switch out.
+2. Sets **System Settings → Keyboard → "Press 🌐 key to"** to **Do Nothing**, so macOS doesn't switch a second time and cancel globe-switch out. It then restarts macOS's `TextInputSwitcher` process, which caches that setting.
 3. Installs and starts a LaunchAgent (`~/Library/LaunchAgents/com.local.globe-switch.plist`).
 
 ### Grant permission (required)
@@ -59,7 +59,10 @@ Press the Globe key. That's it: tap or hold, your language switches straight awa
 ## Troubleshooting
 
 - **Short taps switch but long presses don't:** globe-switch isn't running with permission, so you're seeing macOS's default behavior. Check the log with `tail /tmp/globe-switch.log`. A repeating `no Input Monitoring permission` line means step 2 above isn't done. When it's working, every press logs `globe down` and `switch A -> B`.
-- **It switches and then switches straight back:** macOS's own Globe action is still on. Set "Press 🌐 key to" to **Do Nothing**.
+- **Quick taps don't stick, or the language popup shows the wrong language:** macOS's own Globe action is still on. It switches back as you release a quick tap, and its popup shows *its* choice. globe-switch detects this and switches back again within about 1 second (you'll see `re-applied` lines in the log), but the popup will still be wrong. To fix it for real, make sure "Press 🌐 key to" is **Do Nothing**, then restart the process that caches that setting:
+  ```bash
+  killall -9 TextInputSwitcher   # macOS relaunches it automatically
+  ```
 - **Is it running?** `launchctl print gui/$(id -u)/com.local.globe-switch | grep state`
 - **After rebuilding (re-running `./install.sh`):** macOS ties the permission to the exact build, so a rebuild can silently invalidate it. In Input Monitoring, remove GlobeSwitch with **–** and add it again.
 
@@ -76,6 +79,10 @@ This stops and removes GlobeSwitch.app and sets "Press 🌐 key to" back to **Ch
 `main.swift` creates a `CGEventTap` for `flagsChanged` and `keyDown` events. When the fn/Globe key (keycode 63) goes down, it reads the enabled, selectable keyboard input sources with the Text Input Sources API (`TISCreateInputSourceList`) and selects the one after the current one with `TISSelectInputSource`. If a `keyDown` arrives while Globe is still held, it restores the previous source.
 
 On startup it checks for Input Monitoring access with `CGPreflightListenEventAccess`. A listen-only tap can be created without permission but then receives nothing, so without access it asks for it, waits 15 seconds, and exits, and launchd restarts it. Every Globe press and switch is logged to `/tmp/globe-switch.log`.
+
+Two safety nets:
+- **Switch-back guard:** for 1 second after a Globe press or release, it watches for input-source change notifications (`kTISNotifySelectedKeyboardInputSourceChanged`). If something else (usually macOS's own Globe action) switches away from the source globe-switch chose, it selects that source again.
+- **Debounce:** a Globe press within 40 ms of the previous release is ignored as switch bounce.
 
 ## License
 

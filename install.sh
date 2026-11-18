@@ -28,6 +28,9 @@ codesign -s - -f --identifier "$LABEL" "$APP"
 
 echo "Setting 'Press 🌐 key to' -> Do Nothing (so macOS doesn't also switch)..."
 defaults write com.apple.HIToolbox AppleFnUsageType -int 0
+# TextInputSwitcher handles the Globe key (and its language popup) and caches this
+# setting. Restart it so it stops switching on its own; macOS relaunches it on demand.
+killall -9 TextInputSwitcher 2>/dev/null || true
 
 echo "Installing LaunchAgent..."
 mkdir -p "$(dirname "$PLIST")"
@@ -51,4 +54,5 @@ echo
 echo "Done. If the Globe key doesn't switch input sources yet:"
 echo "  1. System Settings > Privacy & Security > Input Monitoring: enable GlobeSwitch ($APP)"
 echo "  2. System Settings > Keyboard: confirm 'Press 🌐 key to' is 'Do Nothing'"
+echo "     (if quick taps still don't stick, run: killall -9 TextInputSwitcher)"
 echo "  3. Restart it: launchctl kickstart -k gui/\$(id -u)/$LABEL"
