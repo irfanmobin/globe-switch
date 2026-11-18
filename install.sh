@@ -45,6 +45,7 @@ cat > "$PLIST" <<PL
   <key>ProgramArguments</key><array><string>$BIN</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
   <key>StandardErrorPath</key><string>/tmp/globe-switch.log</string>
   <key>StandardOutPath</key><string>/tmp/globe-switch.log</string>
 </dict></plist>

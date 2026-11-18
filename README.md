@@ -14,7 +14,7 @@ globe-switch is a small background program (one Swift file, no dependencies) tha
 - **Cycles through your enabled keyboard layouts and input methods** (e.g. U.S. ↔ Arabic, or English → French → Japanese).
 - **Keeps Globe/fn shortcuts working.** If you press another key while holding Globe (fn+Delete, fn+←/→, Globe+E for emoji, Globe+F for full screen), the switch is undone, so shortcuts don't change your language.
 - **Shows the language you switched to, right at your text cursor**: a small blue bubble with the language's letter (**A** for English and other Latin-script languages, **ع** for Arabic, **א** for Hebrew, **Б** for Russian, and so on). It appears just below the caret and fades out after about a second.
-- Starts automatically at login through a LaunchAgent.
+- Starts automatically at login through a LaunchAgent, and **keeps working after sleep**: close the lid, open it, and the Globe key works straight away.
 
 ### Why its own popup?
 
@@ -79,6 +79,7 @@ Press the Globe key. That's it: tap or hold, your language switches straight awa
   ```
 - **No bubble appears:** check the log. Each press that can't show a bubble logs a `no popup: <reason>` line. The usual reason is missing **Accessibility** permission (see above, and re-grant it after any rebuild). A few apps don't report their cursor position at all. In those, globe-switch skips the bubble rather than showing it in the wrong place.
 - **macOS's own popup still appears next to the bubble:** apps read the setting that hides it when they launch. Quit the app with ⌘Q and reopen it, or log out and back in once.
+- **Stopped working after sleep or unlock:** this should fix itself within a few seconds. The log shows what happened: look for `system going to sleep`, then `system woke` / `screen unlocked` followed by `event tap rebuilt`. If those lines are there but the key still doesn't work, restart it with `launchctl kickstart -k gui/$(id -u)/com.local.globe-switch` and open an issue with the log.
 - **Is it running?** `launchctl print gui/$(id -u)/com.local.globe-switch | grep state`
 - **Stopped working after re-running `./install.sh`:** macOS ties permissions to the exact build, so a rebuild silently invalidates them. In both Input Monitoring and Accessibility, remove GlobeSwitch with **–** and add it again.
 
@@ -97,6 +98,11 @@ This stops and removes GlobeSwitch.app, sets "Press 🌐 key to" back to **Chang
 On startup it checks for Input Monitoring access with `CGPreflightListenEventAccess`. A listen-only tap can be created without permission but then receives nothing, so without access it asks for it, waits 15 seconds, and exits, and launchd restarts it. Every Globe press and switch is logged to `/tmp/globe-switch.log`.
 
 **The bubble:** after each switch, globe-switch asks the focused app (through the Accessibility API) for the text caret's position: `kAXSelectedTextRangeAttribute`, then `kAXBoundsForRangeParameterizedAttribute`. Some apps, such as Terminal, return an empty box for the caret. For those it uses the position of the character at or just before the caret instead. If it still can't find the caret, it shows nothing; the bubble never appears at the mouse pointer. The bubble is a borderless, non-activating `NSPanel`, so it never takes focus. It shows the first letter of the input source's script (from `kTISPropertyInputSourceLanguages`), centered on the letter's actual shape, and fades out after about 0.9 seconds.
+
+**Surviving sleep and wake:** after sleep, a screen lock, or a user switch, macOS can disable or invalidate an event tap without sending the usual `tapDisabledByTimeout` / `tapDisabledByUserInput` event, so a program looks alive but receives nothing. globe-switch therefore:
+- rebuilds its event tap whenever the system or display wakes, the user session becomes active, or the screen is unlocked (`NSWorkspace.didWakeNotification`, `screensDidWakeNotification`, `sessionDidBecomeActiveNotification`, `com.apple.screenIsUnlocked`), and clears any half-finished Globe press;
+- checks the tap every 3 seconds and re-enables or rebuilds it if it was silently disabled or invalidated;
+- exits if Input Monitoring permission disappears or the tap can't be rebuilt after 5 tries, so launchd (`KeepAlive`, `ProcessType` Interactive) restarts it cleanly.
 
 Two safety nets:
 - **Switch-back guard:** for 1 second after a Globe press or release, it watches for input-source change notifications (`kTISNotifySelectedKeyboardInputSourceChanged`). If something else (usually macOS's own Globe action) switches away from the source globe-switch chose, it selects that source again.

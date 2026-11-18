@@ -240,6 +240,7 @@ func inputSourceChanged() {
 
 let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
 var tapRef: CFMachPort?
+var tapSource: CFRunLoopSource?
 
 let callback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -276,6 +277,82 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
     return Unmanaged.passUnretained(event)
 }
 
+// MARK: - Event tap lifecycle (survive sleep/wake)
+// After sleep, screen lock, or a user switch, macOS can leave an event tap disabled
+// or dead without sending tapDisabledBy*, so the app looks alive but hears nothing.
+// So: rebuild the tap on every wake/unlock, and check it every few seconds.
+
+@discardableResult
+func installTap() -> Bool {
+    if let old = tapRef {
+        CGEvent.tapEnable(tap: old, enable: false)
+        if let src = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+        CFMachPortInvalidate(old)
+        tapRef = nil; tapSource = nil
+    }
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                      eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: nil)
+    else { return false }
+    let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    tapRef = tap; tapSource = src
+    return true
+}
+
+var tapFailures = 0
+
+/// Recreate the tap; if that keeps failing, exit so launchd starts a fresh process.
+func rebuildTap(_ reason: String) {
+    // A Globe release may have been lost while asleep; don't let stale state eat the next press.
+    fnDown = false; switchedThisPress = false; target = nil
+    if installTap() {
+        tapFailures = 0
+        log("event tap rebuilt (\(reason))")
+    } else {
+        tapFailures += 1
+        log("could not rebuild event tap (\(reason)), attempt \(tapFailures)")
+        if tapFailures >= 5 { log("giving up; exiting so launchd restarts globe-switch"); exit(1) }
+    }
+}
+
+func checkTapHealth() {
+    if !CGPreflightListenEventAccess() {
+        // Permission revoked (or invalidated by a rebuild): restart into the permission-wait loop.
+        log("lost Input Monitoring permission; exiting so launchd restarts globe-switch")
+        exit(1)
+    }
+    guard let tap = tapRef, CFMachPortIsValid(tap) else { rebuildTap("tap was invalid"); return }
+    if !CGEvent.tapIsEnabled(tap: tap) {
+        CGEvent.tapEnable(tap: tap, enable: true)
+        log("event tap was silently disabled; re-enabled")
+    }
+}
+
+func watchSleepWake() {
+    let ws = NSWorkspace.shared.notificationCenter
+    ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in log("system going to sleep") }
+    let rebuildOn: [(Notification.Name, String)] = [
+        (NSWorkspace.didWakeNotification, "system woke"),
+        (NSWorkspace.screensDidWakeNotification, "display woke"),
+        (NSWorkspace.sessionDidBecomeActiveNotification, "user session active"),
+    ]
+    for (name, reason) in rebuildOn {
+        ws.addObserver(forName: name, object: nil, queue: .main) { _ in
+            log(reason)
+            rebuildTap(reason)
+            // The window server can still be settling right after wake; check again shortly.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { checkTapHealth() }
+        }
+    }
+    DistributedNotificationCenter.default().addObserver(
+        forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { _ in
+        log("screen unlocked")
+        rebuildTap("screen unlocked")
+    }
+    Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in checkTapHealth() }
+}
+
 // MARK: - Startup
 
 // A listen-only tap can be created without permission but then receives nothing,
@@ -291,15 +368,11 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // no Dock icon, never steals focus
 popup = LanguagePopup()
 
-tapRef = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-                           eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: nil)
-guard let tap = tapRef else {
+guard installTap() else {
     log("could not create event tap; retrying in 10s")
     sleep(10)   // avoid a tight launchd restart loop
     exit(1)
 }
-CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
-CGEvent.tapEnable(tap: tap, enable: true)
 DistributedNotificationCenter.default().addObserver(
     forName: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
     object: nil, queue: .main) { _ in inputSourceChanged() }
@@ -309,6 +382,7 @@ DistributedNotificationCenter.default().addObserver(
 if !AXIsProcessTrusted() {
     _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
 }
+watchSleepWake()
 // Opt out of App Nap so event handling and the popup stay prompt in the background.
 let appNapActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
                                                            reason: "Respond to the Globe key immediately")
