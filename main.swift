@@ -53,6 +53,62 @@ func sourceGlyph(_ s: TISInputSource) -> String {
     return code.uppercased()
 }
 
+// MARK: - Waking up apps' accessibility
+// Chromium/Electron apps (VS Code, Slack, Chrome...) and Firefox keep their accessibility
+// tree off until an assistive app asks for it, so they report no text cursor. Ask once
+// per process: AXManualAccessibility (Electron/Chromium, no side effects), falling back to
+// AXEnhancedUserInterface for browsers that don't support it.
+
+var axManualPIDs = Set<pid_t>()     // asked via AXManualAccessibility (or known browser)
+var axEnhancedPIDs = Set<pid_t>()   // asked via AXEnhancedUserInterface
+let enhancedUIBrowsers: Set<String> = [
+    "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly",
+    "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "org.chromium.Chromium",
+    "com.brave.Browser", "com.microsoft.edgemac", "company.thebrowser.Browser",
+    "com.vivaldi.Vivaldi", "com.operasoftware.Opera",
+]
+
+/// Ask an app to turn its accessibility on. `force` (used only after an app failed to
+/// report its caret) also sets AXEnhancedUserInterface, which apps like Microsoft Office
+/// need before they expose their documents. Returns true if a new request was made.
+@discardableResult
+func enableAccessibility(_ app: NSRunningApplication, force: Bool = false) -> Bool {
+    let pid = app.processIdentifier
+    guard AXIsProcessTrusted(), pid != getpid() else { return false }
+    let el = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(el, 0.1)
+    let name = app.localizedName ?? "?"
+    var asked = false
+    if !axManualPIDs.contains(pid) {
+        axManualPIDs.insert(pid); asked = true
+        let manual = AXUIElementSetAttributeValue(el, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        if manual == .success { log("asked \(name) to enable accessibility (AXManualAccessibility)") }
+        else if let id = app.bundleIdentifier, enhancedUIBrowsers.contains(id) {
+            axEnhancedPIDs.insert(pid)
+            let e = AXUIElementSetAttributeValue(el, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+            log("asked \(name) to enable accessibility (AXEnhancedUserInterface: \(e.rawValue))")
+        }
+    }
+    if force && !axEnhancedPIDs.contains(pid) {
+        axEnhancedPIDs.insert(pid); asked = true
+        let e = AXUIElementSetAttributeValue(el, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        log("asked \(name) for full accessibility (AXEnhancedUserInterface: \(e.rawValue))")
+    }
+    return asked
+}
+
+/// The first time an app can't give us a caret, log what its focused element does offer.
+var dumpedApps = Set<String>()
+func dumpElementOnce(_ element: AXUIElement, app: String) {
+    guard dumpedApps.insert(app).inserted else { return }
+    var role: CFTypeRef?, names: CFArray?, pnames: CFArray?
+    AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+    AXUIElementCopyAttributeNames(element, &names)
+    AXUIElementCopyParameterizedAttributeNames(element, &pnames)
+    log("  \(app) focused element: role=\(role as? String ?? "?") attrs=\((names as? [String]) ?? []) "
+        + "params=\((pnames as? [String]) ?? [])")
+}
+
 // MARK: - Our language popup
 // macOS's own popup is disabled (TSMLanguageIndicatorEnabled = false) because it
 // sometimes shows the previous language after a programmatic switch. Ours is drawn
@@ -80,6 +136,7 @@ final class LanguagePopup {
     private let panel: NSPanel
     private let glyphView = GlyphView()
     private var hideWork: DispatchWorkItem?
+    private var generation = 0
 
     init() {
         let side = GlyphView.side
@@ -100,12 +157,24 @@ final class LanguagePopup {
         panel.contentView = glyphView
     }
 
-    func show(_ source: TISInputSource) {
+    func show(_ source: TISInputSource, retry: Bool = false) {
+        if !retry { generation += 1 }
+        let gen = generation
         glyphView.glyph = sourceGlyph(source)
         let size = NSSize(width: GlyphView.side, height: GlyphView.side)
 
         // Only show at the text caret; if we can't find it, show nothing.
-        guard let anchor = caretAnchor() else { hide(); return }
+        guard let anchor = caretAnchor() else {
+            // The app may just need its accessibility switched on; give it a moment and try once more.
+            if !retry, let app = NSWorkspace.shared.frontmostApplication, enableAccessibility(app, force: true) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    guard let self = self, self.generation == gen else { return }
+                    self.show(source, retry: true)
+                }
+                return
+            }
+            hide(); return
+        }
         var origin = NSPoint(x: anchor.x, y: anchor.y - size.height - 3)
         let screen = NSScreen.screens.first { NSMouseInRect(anchor, $0.frame, false) } ?? NSScreen.main
         if let vf = screen?.visibleFrame {
@@ -150,22 +219,61 @@ final class LanguagePopup {
         guard AXIsProcessTrusted() else {
             return fail("no Accessibility permission (System Settings > Privacy & Security > Accessibility)")
         }
-        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-        let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.05)   // never hang on an unresponsive app
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-              let f = focused, CFGetTypeID(f) == AXUIElementGetTypeID() else {
+        let front = NSWorkspace.shared.frontmostApplication
+        let app = front?.localizedName ?? "?"
+        func focusedElement(of container: AXUIElement) -> AXUIElement? {
+            AXUIElementSetMessagingTimeout(container, 0.05)   // never hang on an unresponsive app
+            var focused: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(container, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+                  let f = focused, CFGetTypeID(f) == AXUIElementGetTypeID() else { return nil }
+            return (f as! AXUIElement)
+        }
+        // System-wide first; some apps (e.g. Electron) only answer when asked directly.
+        guard let element = focusedElement(of: AXUIElementCreateSystemWide())
+                ?? front.flatMap({ focusedElement(of: AXUIElementCreateApplication($0.processIdentifier)) }) else {
             return fail("\(app) has no focused text element")
         }
-        let element = f as! AXUIElement
         AXUIElementSetMessagingTimeout(element, 0.05)
+
+        // Last resort for single-line fields (URL bars, search boxes) that won't say where
+        // the caret is: the left edge of the field itself. Never used for big editors.
+        func smallFieldRect() -> CGRect? {
+            var pv: CFTypeRef?, sv: CFTypeRef?
+            var pos = CGPoint.zero, size = CGSize.zero
+            guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &pv) == .success,
+                  AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sv) == .success,
+                  let p = pv, let sz = sv,
+                  AXValueGetValue(p as! AXValue, .cgPoint, &pos), AXValueGetValue(sz as! AXValue, .cgSize, &size),
+                  size.height > 0, size.height <= 60, size.width > 0 else { return nil }
+            log("  popup at \(app)'s text field (no exact caret)")
+            return CGRect(x: pos.x + 4, y: pos.y, width: 0, height: size.height)
+        }
+
+        // WebKit-style text markers (Safari, Mail, Pages, Word, ...), used by apps that
+        // don't offer AXSelectedTextRange / AXBoundsForRange.
+        func textMarkerRect() -> CGRect? {
+            var mr: CFTypeRef?, b: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, "AXSelectedTextMarkerRange" as CFString, &mr) == .success,
+                  let markers = mr,
+                  AXUIElementCopyParameterizedAttributeValue(element, "AXBoundsForTextMarkerRange" as CFString,
+                                                             markers, &b) == .success,
+                  let bv = b, CFGetTypeID(bv) == AXValueGetTypeID() else { return nil }
+            var rect = CGRect.zero
+            guard AXValueGetValue(bv as! AXValue, .cgRect, &rect), rect.height > 0, rect.height < 200 else { return nil }
+            return CGRect(x: rect.maxX, y: rect.minY, width: 0, height: rect.height)
+        }
+
+        func giveUp(_ why: String) -> CGRect? {
+            if let r = textMarkerRect() ?? smallFieldRect() { return r }
+            if let pid = front?.processIdentifier, axEnhancedPIDs.contains(pid) { dumpElementOnce(element, app: app) }
+            return fail(why)
+        }
         var rangeValue: CFTypeRef?
         var sel = CFRange(location: 0, length: 0)
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeValue) == .success,
               let rv = rangeValue, CFGetTypeID(rv) == AXValueGetTypeID(),
               AXValueGetValue(rv as! AXValue, .cfRange, &sel) else {
-            return fail("\(app) doesn't report a text cursor")
+            return giveUp("\(app) doesn't report a text cursor")
         }
 
         func bounds(_ r: CFRange) -> CGRect? {
@@ -193,7 +301,7 @@ final class LanguagePopup {
                 return CGRect(x: r.maxX, y: r.minY, width: 0, height: r.height)
             }
         }
-        return fail("\(app) doesn't report where its text cursor is")
+        return giveUp("\(app) doesn't report where its text cursor is")
     }
 }
 
@@ -353,6 +461,19 @@ func watchSleepWake() {
     Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in checkTapHealth() }
 }
 
+func watchAppActivation() {
+    let ws = NSWorkspace.shared.notificationCenter
+    ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
+        if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication { enableAccessibility(app) }
+    }
+    ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { n in
+        if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+            axManualPIDs.remove(app.processIdentifier); axEnhancedPIDs.remove(app.processIdentifier)
+        }
+    }
+    if let front = NSWorkspace.shared.frontmostApplication { enableAccessibility(front) }
+}
+
 // MARK: - Startup
 
 // A listen-only tap can be created without permission but then receives nothing,
@@ -383,6 +504,7 @@ if !AXIsProcessTrusted() {
     _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
 }
 watchSleepWake()
+watchAppActivation()
 // Opt out of App Nap so event handling and the popup stay prompt in the background.
 let appNapActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
                                                            reason: "Respond to the Globe key immediately")
